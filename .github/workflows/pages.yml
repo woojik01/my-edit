@@ -19,9 +19,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -31,9 +31,6 @@ jobs:
         run: npm run build
         env:
           BASE_PATH: /my-edit/
-      - name: Configure GitHub Pages
-        if: github.event_name != 'pull_request'
-        uses: actions/configure-pages@v5
       - name: Upload the site artifact
         if: github.event_name != 'pull_request'
         uses: actions/upload-pages-artifact@v4
@@ -51,6 +48,8 @@ jobs:
       pages: write
       id-token: write
     steps:
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
