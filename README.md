@@ -17,6 +17,12 @@ npm run build
 npm run preview
 ```
 
+## GitHub Pages
+
+Set the publishing source to the `main` branch and `/(root)` in repository Settings → Pages. Run `npm run build:pages` before committing app changes; it builds the PWA and copies the ready-to-serve files into the repository root. GitHub Pages then publishes the committed `index.html` and assets from `main`.
+
+The site opens at `https://woojik01.github.io/my-edit/`. The `/my-edit/index/` shortcut redirects to the home page.
+
 ## Offline behavior
 
 The production build precaches the application shell and bundled editor. First use needs a network connection so the service worker can install its cache. After the app reports that offline use is ready, documents can be edited, previewed, imported, and exported without a connection. External resources referenced by an HTML document still require their own network access.
