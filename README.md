@@ -17,6 +17,10 @@ npm run build
 npm run preview
 ```
 
+## GitHub Pages
+
+In repository Settings → Pages, set the source to **GitHub Actions**. The workflow builds the app for the `/my-edit/` project path and deploys it whenever changes reach `main`. The expected site URL is `https://woojik01.github.io/my-edit/`.
+
 ## Offline behavior
 
 The production build precaches the application shell and bundled editor. First use needs a network connection so the service worker can install its cache. After the app reports that offline use is ready, documents can be edited, previewed, imported, and exported without a connection. External resources referenced by an HTML document still require their own network access.
