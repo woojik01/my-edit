@@ -22,6 +22,7 @@ type SaveStatus = 'saved' | 'saving' | 'error';
 interface Settings { wrap: boolean; indent: string; fontSize: number }
 interface BeforeInstallPromptEvent extends Event { prompt(): Promise<void>; userChoice: Promise<{ outcome: string }> }
 const root = document.querySelector<HTMLDivElement>('#app')!;
+const TOAST_AUTO_DISMISS_MS = 5_000;
 const docs = new Map<string, TextDocument>();
 const states = new Map<string, EditorState>();
 const statuses = new Map<string, SaveStatus>();
@@ -43,6 +44,9 @@ let offlineReady = false;
 let installPrompt: BeforeInstallPromptEvent | null = null;
 let applyUpdate: ((reloadPage?: boolean) => Promise<void>) | undefined;
 let toastTimer = 0;
+let toastExpiry = 0;
+let toastRemaining = TOAST_AUTO_DISMISS_MS;
+let toastDrag: { pointerId: number; startX: number; startY: number; lastX: number; lastAt: number; velocityX: number; dragging: boolean } | null = null;
 let importBusy = false;
 let explorerQuery = '';
 let trashRetentionDays = 30;
@@ -79,13 +83,92 @@ function saveSession() {
 }
 function current(): TextDocument | undefined { return activeId ? docs.get(activeId) : undefined; }
 function dirty(doc: TextDocument): boolean { return doc.exportedRevision !== doc.revision; }
+function clearToastMotion(host: HTMLElement) {
+  host.classList.remove('dragging', 'dismissing');
+  for (const property of ['--toast-drag-x', '--toast-drag-rotation', '--toast-drag-scale', '--toast-drag-opacity', '--toast-exit-x', '--toast-exit-rotation']) host.style.removeProperty(property);
+}
+function scheduleToastDismiss(delay = TOAST_AUTO_DISMISS_MS) {
+  window.clearTimeout(toastTimer);
+  toastRemaining = Math.max(0, delay);
+  toastExpiry = Date.now() + toastRemaining;
+  toastTimer = window.setTimeout(() => {
+    const host = document.querySelector<HTMLDivElement>('#toast');
+    host?.classList.remove('visible', 'dragging');
+    if (host) clearToastMotion(host);
+    toastRemaining = 0;
+    toastDrag = null;
+  }, toastRemaining);
+}
+function bindToastGestures(host: HTMLDivElement) {
+  host.addEventListener('pointerdown', (event) => {
+    if (!host.classList.contains('visible') || !event.isPrimary || (event.pointerType === 'mouse' && event.button !== 0)) return;
+    if ((event.target as Element).closest('button')) return;
+    toastDrag = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, lastX: event.clientX, lastAt: performance.now(), velocityX: 0, dragging: false };
+  });
+  host.addEventListener('pointermove', (event) => {
+    const gesture = toastDrag;
+    if (!gesture || gesture.pointerId !== event.pointerId || !host.classList.contains('visible')) return;
+    const dx = event.clientX - gesture.startX;
+    const dy = event.clientY - gesture.startY;
+    if (!gesture.dragging) {
+      if (Math.abs(dx) < 7) return;
+      if (Math.abs(dy) > Math.abs(dx)) { toastDrag = null; return; }
+      gesture.dragging = true;
+      toastRemaining = Math.max(0, toastExpiry - Date.now());
+      window.clearTimeout(toastTimer);
+      host.setPointerCapture(event.pointerId);
+      host.classList.add('dragging');
+    }
+    event.preventDefault();
+    const width = Math.max(1, host.getBoundingClientRect().width);
+    const now = performance.now();
+    const rotation = Math.max(-7, Math.min(7, dx / 24));
+    const scale = 1 - Math.min(Math.abs(dx) / 2_400, 0.035);
+    const opacity = 1 - Math.min(Math.abs(dx) / (width * 1.15), 0.38);
+    host.style.setProperty('--toast-drag-x', `${dx}px`);
+    host.style.setProperty('--toast-drag-rotation', `${rotation}deg`);
+    host.style.setProperty('--toast-drag-scale', String(scale));
+    host.style.setProperty('--toast-drag-opacity', String(opacity));
+    gesture.velocityX = (event.clientX - gesture.lastX) / Math.max(1, now - gesture.lastAt);
+    gesture.lastX = event.clientX;
+    gesture.lastAt = now;
+  });
+  const finishGesture = (event: PointerEvent, cancelled = false) => {
+    const gesture = toastDrag;
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    toastDrag = null;
+    if (!gesture.dragging) return;
+    const dx = event.clientX - gesture.startX;
+    const releaseVelocity = (event.clientX - gesture.lastX) / Math.max(1, performance.now() - gesture.lastAt);
+    const velocity = Math.abs(releaseVelocity) > 0.15 ? releaseVelocity : gesture.velocityX;
+    const width = Math.max(1, host.getBoundingClientRect().width);
+    const threshold = Math.min(96, Math.max(56, width * 0.22));
+    const shouldDismiss = !cancelled && (Math.abs(dx) >= threshold || (Math.abs(dx) >= 28 && Math.abs(velocity) >= 0.6));
+    if (shouldDismiss) {
+      const direction = Math.sign(dx || velocity);
+      host.style.setProperty('--toast-exit-x', `${direction * (window.innerWidth + width)}px`);
+      host.style.setProperty('--toast-exit-rotation', `${direction * 10}deg`);
+      host.classList.remove('dragging');
+      host.classList.add('dismissing');
+      host.classList.remove('visible');
+      window.clearTimeout(toastTimer);
+      toastRemaining = 0;
+      return;
+    }
+    clearToastMotion(host);
+    if (host.classList.contains('visible')) scheduleToastDismiss(toastRemaining);
+  };
+  host.addEventListener('pointerup', (event) => finishGesture(event));
+  host.addEventListener('pointercancel', (event) => finishGesture(event, true));
+}
 function toast(message: string, action?: { label: string; run: () => void }) {
   const host = document.querySelector<HTMLDivElement>('#toast')!;
+  window.clearTimeout(toastTimer);
+  clearToastMotion(host);
   host.innerHTML = `<span>${esc(message)}</span>${action ? `<button>${esc(action.label)}</button>` : ''}`;
   host.classList.add('visible');
   if (action) host.querySelector('button')!.onclick = action.run;
-  window.clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => host.classList.remove('visible'), action ? 12_000 : 4500);
+  scheduleToastDismiss();
 }
 function task(operation: () => void | Promise<void>) {
   try { Promise.resolve(operation()).catch(reportError); } catch (error) { reportError(error); }
@@ -140,6 +223,7 @@ function renderShell() {
     <div id="file-menu" class="file-menu" role="menu" hidden></div>
     <input type="file" id="file-input" multiple hidden><input type="file" id="backup-input" accept=".json,application/json" hidden>
   </div><div class="toast" id="toast" role="status" aria-live="polite"></div>`;
+  bindToastGestures(document.querySelector<HTMLDivElement>('#toast')!);
   document.documentElement.style.setProperty('--editor-font', `${settings.fontSize}px`);
   document.querySelector('#file-search')!.addEventListener('input', (event) => { explorerQuery = (event.target as HTMLInputElement).value; renderExplorer(); });
   const fileList = document.querySelector<HTMLDivElement>('#file-list')!;

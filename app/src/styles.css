@@ -157,8 +157,10 @@ kbd { margin-left: auto; color: #738367; font: 9px var(--mono); }
 .drop-overlay.visible { display: flex; }
 .drop-overlay > span svg { width: 56px; height: 56px; stroke-width: 1; }
 .drop-overlay b { font-size: 22px; font-weight: 500; }.drop-overlay p { font-size: 13px; color: #9cac86; }
-.toast { position: fixed; z-index: 150; bottom: 48px; left: 50%; display: flex; align-items: center; gap: 15px; max-width: calc(100vw - 32px); padding: 13px 16px; border: 1px solid #5b6d42; border-radius: 10px; color: #d9e5c8; background: #2b3826; box-shadow: 0 10px 40px #02080366; font-size: 11px; line-height: 1.65; opacity: 0; transform: translate(-50%, 10px); pointer-events: none; transition: opacity .15s, transform .15s; }
-.toast.visible { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
+.toast { position: fixed; z-index: 150; bottom: 48px; left: 50%; display: flex; align-items: center; gap: 15px; max-width: calc(100vw - 32px); padding: 13px 16px; border: 1px solid #5b6d42; border-radius: 10px; color: #d9e5c8; background: #2b3826; box-shadow: 0 10px 40px #02080366; font-size: 11px; line-height: 1.65; opacity: 0; transform: translate(-50%, 10px); pointer-events: none; touch-action: pan-y; user-select: none; transition: opacity .2s ease, transform .24s cubic-bezier(.2,.75,.25,1); }
+.toast.visible { opacity: 1; transform: translate(calc(-50% + var(--toast-drag-x, 0px)), 0); pointer-events: auto; }
+.toast.dragging { opacity: var(--toast-drag-opacity, 1); transform: translate(calc(-50% + var(--toast-drag-x, 0px)), 0) rotate(var(--toast-drag-rotation, 0deg)) scale(var(--toast-drag-scale, 1)); transition: none; cursor: grabbing; }
+.toast.dismissing { opacity: 0; transform: translate(calc(-50% + var(--toast-exit-x, 0px)), -6px) rotate(var(--toast-exit-rotation, 0deg)) scale(.96); pointer-events: none; transition: opacity .24s ease-out, transform .32s cubic-bezier(.2,.8,.25,1); }
 .toast button { flex-shrink: 0; padding: 0; border: 0; background: transparent; color: var(--lime); font-size: 11px; font-weight: 600; }
 @media (max-width: 1050px) { .workbench { grid-template-columns: 225px minmax(0, 1fr); }.app-description { display: none; }.statusbar { padding: 0 9px; }.status-tools { gap: 0; }.status-tools > span { display: none; }.local-status { font-size: 8px; }.status-tools button { font-size: 8px; padding: 0 5px; } }
 @media (max-width: 760px) {
