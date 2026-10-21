@@ -13,6 +13,20 @@ function inlineMarkdown(value: string): string {
     .replace(/(^|[^*])\*([^*]+)\*/g, '$1<em>$2</em>');
 }
 
+export function instrumentHtmlPreview(source: string, channel: string): string {
+  const bridge = `<script>(()=>{
+    const channel=${JSON.stringify(channel)};
+    const stringify=value=>{if(value instanceof Error)return value.stack||value.message;if(typeof value==='string')return value;try{const json=JSON.stringify(value);return json===undefined?String(value):json}catch{return String(value)}};
+    const send=(kind,values)=>{try{parent.postMessage({type:'my-edit-preview-log',channel,kind,message:values.map(stringify).join(' ').slice(0,4000)},'*')}catch{}};
+    addEventListener('error',event=>send('runtime error',[event.message||'스크립트 오류',event.filename?event.filename+':'+(event.lineno||0)+':'+(event.colno||0):'']));
+    addEventListener('unhandledrejection',event=>send('promise rejection',[event.reason]));
+    const originalError=console.error.bind(console);console.error=(...values)=>{send('console.error',values);originalError(...values)};
+  })()<\/script>`;
+  const head = /<head\b[^>]*>/i.exec(source);
+  if (head) return `${source.slice(0, head.index + head[0].length)}${bridge}${source.slice(head.index + head[0].length)}`;
+  return `${bridge}${source}`;
+}
+
 export function markdownToHtml(source: string): string {
   const lines = source.replace(/\r\n?/g, '\n').split('\n');
   const blocks: string[] = [];

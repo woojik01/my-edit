@@ -10,6 +10,8 @@ export interface SaveTarget {
   directoryName: string;
   fileName: string;
   lastModified: number | null;
+  /** True after My Edit removed the linked device file while moving it to trash. */
+  deviceDeleted?: boolean;
 }
 const DB_NAME = 'my-edit-local';
 const DB_VERSION = 3;
