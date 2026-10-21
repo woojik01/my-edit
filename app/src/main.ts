@@ -532,7 +532,7 @@ document.addEventListener('click', (event) => {
   else if (action === 'save-as') task(() => saveFile(true));
   else if (action === 'rename') showNewFile(true);
   else if (action === 'more') toggleMenu();
-  else if (action === 'find' && view && current()) { openSearchPanel(view); view.focus(); }
+  else if (action === 'find' && view && current()) openSearchPanel(view);
   else if (action === 'undo' && view && current()) undo(view);
   else if (action === 'redo' && view && current()) redo(view);
   else if (action === 'comment' && view && current()) toggleComment(view);
