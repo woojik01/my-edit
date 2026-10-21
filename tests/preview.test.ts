@@ -1,6 +1,15 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { markdownToHtml } from '../app/src/preview.ts';
+import { instrumentHtmlPreview, markdownToHtml } from '../app/src/preview.ts';
+
+test('HTML preview adds a runtime and console error bridge inside head', () => {
+  const html = instrumentHtmlPreview('<!doctype html><html><head><title>Test</title></head><body></body></html>', 'preview-token');
+  assert.match(html, /<head><script>/);
+  assert.match(html, /my-edit-preview-log/);
+  assert.match(html, /unhandledrejection/);
+  assert.match(html, /console\.error/);
+  assert.ok(html.indexOf('<script>') < html.indexOf('<title>Test</title>'));
+});
 
 test('Markdown preview formats common blocks and inline styles', () => {
   const html = markdownToHtml('# Title\n\n**bold** and `code`\n\n- one\n- two');
