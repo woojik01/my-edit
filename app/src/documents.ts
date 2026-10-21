@@ -56,3 +56,7 @@ export function parseBackup(text: string): TextDocument[] {
 export function createBackup(documents: TextDocument[]): string {
   return JSON.stringify({ format: 'my-edit-backup', version: 2, exportedAt: new Date().toISOString(), projects: documents }, null, 2);
 }
+export function expiredTrashIds(documents: TextDocument[], retentionDays: number, now = Date.now()): string[] {
+  const age = Math.max(1, Math.min(365, Math.floor(retentionDays))) * 24 * 60 * 60 * 1000;
+  return documents.filter((doc) => doc.deletedAt !== null && now - doc.deletedAt >= age).map((doc) => doc.id);
+}

@@ -1,8 +1,18 @@
 import { normalizeDocument } from './documents.ts';
 import type { TextDocument } from './documents.ts';
+import type { LocalDirectoryHandle, LocalFileHandle } from './native-files.ts';
 export interface RecoveryPoint { id: string; projectId: string; content: string; createdAt: number }
+export interface SaveTarget {
+  projectId: string;
+  kind: 'directory' | 'file';
+  directoryHandle?: LocalDirectoryHandle;
+  fileHandle?: LocalFileHandle;
+  directoryName: string;
+  fileName: string;
+  lastModified: number | null;
+}
 const DB_NAME = 'my-edit-local';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 let dbPromise: Promise<IDBDatabase> | undefined;
 function openDatabase(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise;
@@ -22,6 +32,7 @@ function openDatabase(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains('recovery')) {
         const store = db.createObjectStore('recovery', { keyPath: 'id' }); store.createIndex('projectId', 'projectId');
       }
+      if (!db.objectStoreNames.contains('saveTargets')) db.createObjectStore('saveTargets', { keyPath: 'projectId' });
     };
     request.onsuccess = () => {
       request.result.onversionchange = () => { request.result.close(); dbPromise = undefined; };
@@ -46,6 +57,31 @@ export async function listDocuments(): Promise<TextDocument[]> {
     request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error);
   });
   return rows.map(normalizeDocument).sort((a, b) => b.updatedAt - a.updatedAt);
+}
+export async function listSaveTargets(): Promise<SaveTarget[]> {
+  const db = await openDatabase();
+  const request = db.transaction('saveTargets', 'readonly').objectStore('saveTargets').getAll();
+  return new Promise((resolve, reject) => { request.onsuccess = () => resolve(request.result as SaveTarget[]); request.onerror = () => reject(request.error); });
+}
+export async function saveSaveTarget(target: SaveTarget): Promise<void> {
+  const db = await openDatabase(); const tx = db.transaction('saveTargets', 'readwrite'); const done = transactionDone(tx);
+  tx.objectStore('saveTargets').put(structuredClone(target)); await done;
+}
+export async function deleteSaveTarget(projectId: string): Promise<void> {
+  const db = await openDatabase(); const tx = db.transaction('saveTargets', 'readwrite'); const done = transactionDone(tx);
+  tx.objectStore('saveTargets').delete(projectId); await done;
+}
+export async function deleteDocumentsPermanently(ids: string[]): Promise<void> {
+  if (!ids.length) return;
+  const db = await openDatabase();
+  const tx = db.transaction(['projects', 'saveTargets', 'recovery'], 'readwrite'); const done = transactionDone(tx);
+  const projects = tx.objectStore('projects'), targets = tx.objectStore('saveTargets'), recovery = tx.objectStore('recovery');
+  for (const id of ids) {
+    projects.delete(id); targets.delete(id);
+    const request = recovery.index('projectId').openCursor(IDBKeyRange.only(id));
+    request.onsuccess = () => { const cursor = request.result; if (!cursor) return; cursor.delete(); cursor.continue(); };
+  }
+  await done;
 }
 export async function saveDocument(document: TextDocument, previousContent?: string): Promise<void> {
   const snapshot = structuredClone(document);

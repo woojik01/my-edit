@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { newDocument, normalizeDocument, createBackup, parseBackup } from '../app/src/documents.ts';
+import { expiredTrashIds, newDocument, normalizeDocument, createBackup, parseBackup } from '../app/src/documents.ts';
 import { detectLanguage, languageDescriptions } from '../app/src/languages.ts';
 import { MAX_FILE_BYTES } from '../app/src/files.ts';
 
@@ -36,6 +36,14 @@ test('legacy backups migrate and invalid backups fail as a whole', () => {
   assert.equal(parseBackup(JSON.stringify({ format: 'my-edit-backup', version: 1, projects: [old] }))[0].name, 'legacy.html');
   assert.throws(() => parseBackup(JSON.stringify({ format: 'my-edit-backup', version: 2, projects: [old, { name: 'invalid' }] })));
   assert.throws(() => parseBackup('{"format":"other","projects":[]}'));
+});
+test('trash expiry uses the selected day count and keeps newer items', () => {
+  const now = 1_800_000_000_000;
+  const old = newDocument('old.txt'); old.deletedAt = now - 4 * 24 * 60 * 60 * 1000;
+  const recent = newDocument('recent.txt'); recent.deletedAt = now - 2 * 24 * 60 * 60 * 1000;
+  const live = newDocument('live.txt');
+  assert.deepEqual(expiredTrashIds([old, recent, live], 3, now), [old.id]);
+  assert.deepEqual(expiredTrashIds([old, recent, live], 5, now), []);
 });
 test('common formats, dotfiles, shebangs and unknown files select useful modes', () => {
   for (const [name, language] of [['main.py', 'Python'], ['main.ts', 'TypeScript'], ['data.json', 'JSON'], ['notes.md', 'Markdown'], ['config.yaml', 'YAML'], ['build.rs', 'Rust'], ['Main.kt', 'Kotlin'], ['.env.local', 'Properties files'], ['Dockerfile', 'Dockerfile']]) {

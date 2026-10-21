@@ -6,14 +6,16 @@ import { drawSelection, dropCursor, EditorView, highlightActiveLine, highlightAc
 import { highlightSelectionMatches, openSearchPanel, searchKeymap } from '@codemirror/search';
 import { tags } from '@lezer/highlight';
 import { registerSW } from 'virtual:pwa-register';
-import { createBackup, newDocument, parseBackup } from './documents.ts';
+import { createBackup, expiredTrashIds, newDocument, parseBackup } from './documents.ts';
 import type { TextDocument } from './documents.ts';
 import { decodeText, encodeText, FileReadError, formatBytes, HIGHLIGHT_LIMIT, MAX_FILE_BYTES, READ_ENCODINGS, validateFileName } from './files.ts';
 import type { DecodedText, LineEnding, TextEncoding } from './files.ts';
 import { detectLanguage, fileBadge, languageDescriptions, languageLabel } from './languages.ts';
-import { addRestoredDocuments, listDocuments, listRecoveryPoints, saveDocument } from './persistence.ts';
-import { canPickOpenFiles, canPickSaveFile, downloadBytes, pickOpenFiles, pickSaveFile } from './native-files.ts';
-import type { LocalFileHandle } from './native-files.ts';
+import { addRestoredDocuments, deleteDocumentsPermanently, deleteSaveTarget, listDocuments, listRecoveryPoints, listSaveTargets, saveDocument, saveSaveTarget } from './persistence.ts';
+import type { SaveTarget } from './persistence.ts';
+import { canPickDirectory, canPickOpenFiles, canPickSaveFile, downloadBytes, pickDirectory, pickOpenFiles, pickSaveFile } from './native-files.ts';
+import type { LocalDirectoryHandle, LocalFileHandle } from './native-files.ts';
+import { markdownToHtml } from './preview.ts';
 import './styles.css';
 
 type SaveStatus = 'saved' | 'saving' | 'error';
@@ -27,7 +29,7 @@ const timers = new Map<string, number>();
 const writes = new Map<string, Promise<void>>();
 const persistedContent = new Map<string, string>();
 const recoveryTimes = new Map<string, number>();
-const handles = new Map<string, { handle: LocalFileHandle; modified: number }>();
+const saveTargets = new Map<string, SaveTarget>();
 const languageLoads = new Map<string, number>();
 const diskWrites = new Set<string>();
 const modeCompartment = new Compartment();
@@ -43,6 +45,10 @@ let applyUpdate: ((reloadPage?: boolean) => Promise<void>) | undefined;
 let toastTimer = 0;
 let importBusy = false;
 let explorerQuery = '';
+let trashRetentionDays = 30;
+let longPressTimer = 0;
+let suppressFileClickId: string | null = null;
+const TRASH_RETENTION_KEY = 'my-edit-trash-retention-days';
 
 const esc = (value: string): string => value.replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]!);
 const icon = (name: string): string => {
@@ -101,7 +107,7 @@ function renderShell() {
   <div class="workbench">
     <header class="app-header">
       <button class="icon-button sidebar-toggle" data-action="sidebar" aria-label="파일 목록 열기">${icon('menu')}</button>
-      <a class="brand" href="#" data-action="welcome"><span class="brand-icon">${icon('code')}</span>My Edit <span class="version">0.2</span></a>
+      <a class="brand" href="#" data-action="welcome"><span class="brand-icon">${icon('code')}</span>My Edit <span class="version">0.3</span></a>
       <span class="header-divider"></span><span class="app-description">CODE & TEXT EDITOR</span>
       <div class="header-end"><span class="offline-status" id="offline-status" role="status">오프라인 준비 중</span><button class="install-button" id="update-ready" data-action="apply-update" hidden>업데이트 적용</button><button class="install-button" data-action="install">${icon('download')}<span>앱 설치</span></button></div>
     </header>
@@ -111,13 +117,14 @@ function renderShell() {
       <div class="workspace-actions"><button data-action="open">${icon('folder')}파일 열기</button><button data-action="new">${icon('plus')}새 파일</button></div>
       <label class="file-search">${icon('search')}<input id="file-search" type="search" placeholder="파일 이름으로 찾기" aria-label="작업공간 파일 검색" autocomplete="off"></label>
       <div class="file-list" id="file-list"></div>
-      <div class="sidebar-footer"><button data-action="backup-export">${icon('download')}작업공간 백업</button><button data-action="trash">${icon('trash')}휴지통 <span id="trash-count"></span></button><p>파일은 이 기기에 보관돼요.<br>원본 파일 저장은 저장 버튼을 눌러 주세요.</p></div>
+      <div class="sidebar-footer"><button data-action="backup-export">${icon('download')}작업공간 백업</button><button data-action="trash">${icon('trash')}휴지통 <span id="trash-count"></span></button><p>파일은 이 기기에 보관돼요.<br>파일 저장 시 위치를 선택하고 기억해요.</p></div>
     </aside>
     <main class="main-area">
       <div class="tabs-bar"><div class="file-tabs" id="file-tabs" role="tablist" aria-label="열린 파일"></div><button class="icon-button new-tab-button" data-action="new" aria-label="새 파일 탭">${icon('plus')}</button></div>
       <div class="editor-toolbar"><div class="breadcrumb" id="breadcrumb">작업공간 <span>/</span> 시작</div><div class="toolbar-actions">
         <button class="icon-button desktop-tool" data-action="undo" title="실행 취소 (Ctrl+Z)" aria-label="실행 취소">${icon('undo')}</button><button class="icon-button desktop-tool" data-action="redo" title="다시 실행" aria-label="다시 실행">${icon('redo')}</button>
         <button class="icon-button" data-action="find" title="찾기 / 바꾸기 (Ctrl+F)" aria-label="찾기 및 바꾸기">${icon('search')}</button>
+        <button class="preview-button" data-action="preview" id="preview-button" title="미리보기" aria-label="미리보기">${icon('eye')}<span>미리보기</span></button>
         <button class="save-button" data-action="save" id="save-button">${icon('save')}<span>파일 저장</span></button>
         <button class="icon-button" data-action="more" aria-label="파일 및 편집 메뉴" aria-expanded="false">${icon('more')}</button>
       </div></div>
@@ -130,11 +137,27 @@ function renderShell() {
       <footer class="statusbar"><span class="local-status" id="local-status" role="status">로컬 작업공간</span><div class="status-tools"><button data-action="goto" id="cursor-status">줄 1, 열 1</button><button data-action="settings" id="indent-status">공백: 2</button><button data-action="format" id="encoding-status">UTF-8</button><button data-action="format" id="ending-status">LF</button><button data-action="language" id="language-status">일반 텍스트</button><span id="length-status"></span></div></footer>
     </main>
     <div class="drop-overlay" id="drop-overlay"><span>${icon('folder')}</span><b>텍스트 파일을 여기에 놓으세요</b><p>여러 파일을 한 번에 열 수 있어요.</p></div>
-    <div id="file-menu" class="file-menu" hidden></div>
+    <div id="file-menu" class="file-menu" role="menu" hidden></div>
     <input type="file" id="file-input" multiple hidden><input type="file" id="backup-input" accept=".json,application/json" hidden>
   </div><div class="toast" id="toast" role="status" aria-live="polite"></div>`;
   document.documentElement.style.setProperty('--editor-font', `${settings.fontSize}px`);
   document.querySelector('#file-search')!.addEventListener('input', (event) => { explorerQuery = (event.target as HTMLInputElement).value; renderExplorer(); });
+  const fileList = document.querySelector<HTMLDivElement>('#file-list')!;
+  fileList.addEventListener('pointerdown', (event) => {
+    const row = (event.target as Element).closest<HTMLElement>('[data-open]');
+    if (!row || event.pointerType === 'mouse') return;
+    const id = row.dataset.open!; const x = event.clientX; const y = event.clientY;
+    window.clearTimeout(longPressTimer);
+    longPressTimer = window.setTimeout(() => {
+      suppressFileClickId = id;
+      showFileOptions(id, x, y);
+    }, 520);
+  });
+  for (const name of ['pointerup', 'pointercancel', 'pointerleave']) fileList.addEventListener(name, () => window.clearTimeout(longPressTimer));
+  fileList.addEventListener('contextmenu', (event) => {
+    const row = (event.target as Element).closest<HTMLElement>('[data-open]'); if (!row) return;
+    event.preventDefault(); showFileOptions(row.dataset.open!, event.clientX, event.clientY);
+  });
 }
 function renderExplorer() {
   const visible = [...docs.values()].filter((doc) => doc.deletedAt === null).sort((a, b) => a.name.localeCompare(b.name));
@@ -143,7 +166,7 @@ function renderExplorer() {
   const deleted = [...docs.values()].filter((doc) => doc.deletedAt !== null).length;
   document.querySelector('#trash-count')!.textContent = deleted ? String(deleted) : '';
   document.querySelector('#file-list')!.innerHTML = filtered.length ? filtered.map((doc) => `
-    <button class="file-row${doc.id === activeId ? ' active' : ''}" data-open="${esc(doc.id)}" title="${esc(doc.name)}"><span class="file-badge" data-ext="${esc(doc.name.split('.').pop()?.toLowerCase() ?? '')}">${esc(fileBadge(doc.name))}</span><span class="file-name">${esc(doc.name)}</span><i class="dirty-dot" data-dirty="${esc(doc.id)}"${dirty(doc) ? '' : ' hidden'} title="원본 파일에 저장하지 않은 변경"></i></button>`).join('')
+    <div class="file-row${doc.id === activeId ? ' active' : ''}"><button class="file-open" data-open="${esc(doc.id)}" title="${esc(doc.name)} · 길게 눌러 옵션"><span class="file-badge" data-ext="${esc(doc.name.split('.').pop()?.toLowerCase() ?? '')}">${esc(fileBadge(doc.name))}</span><span class="file-name">${esc(doc.name)}</span></button><i class="dirty-dot" data-dirty="${esc(doc.id)}"${dirty(doc) ? '' : ' hidden'} title="앱 보관 후 파일 저장 필요"></i><button class="file-row-options" data-file-options="${esc(doc.id)}" aria-label="${esc(doc.name)} 파일 옵션" aria-haspopup="menu">${icon('more')}</button></div>`).join('')
     : `<div class="empty-files">${explorerQuery ? '일치하는 파일이 없어요.' : '새 파일을 만들거나<br>기기의 텍스트 파일을 열어 보세요.'}</div>`;
 }
 function renderTabs() {
@@ -163,7 +186,11 @@ function refreshStatus() {
   label.textContent = doc ? status === 'saving' ? '앱에 보관 중…' : status === 'error' ? '앱 보관 실패 · 파일로 저장하세요' : dirty(doc) ? '앱에 보관됨 · 파일 저장 필요' : '앱에 보관됨' : '로컬 작업공간';
   const save = document.querySelector<HTMLButtonElement>('#save-button')!;
   save.disabled = !doc || diskWrites.has(doc.id);
-  save.title = canPickSaveFile() ? '파일로 저장 (Ctrl+S)' : '현재 이름으로 파일 내려받기 (Ctrl+S)';
+  const target = doc ? saveTargets.get(doc.id) : undefined;
+  save.title = target ? `저장 위치: ${target.directoryName} · ${target.fileName || doc!.name}` : canPickDirectory() ? '처음 저장할 때 폴더를 선택해요' : '저장 대화상자에서 파일 위치를 선택해요';
+  const preview = document.querySelector<HTMLButtonElement>('#preview-button')!;
+  preview.disabled = !doc || !canPreview(doc);
+  preview.title = doc && canPreview(doc) ? `${previewType(doc)} 미리보기` : 'HTML, SVG, Markdown 미리보기를 지원해요';
   document.querySelector('#encoding-status')!.textContent = doc ? `${doc.encoding.toUpperCase().replace('UTF-16', 'UTF-16 ')}${doc.bom ? ' BOM' : ''}` : 'UTF-8';
   document.querySelector('#encoding-status')!.setAttribute('title', doc?.convertedFrom ? `${doc.convertedFrom}에서 읽음 · ${doc.encoding.toUpperCase()}로 저장` : '저장 인코딩 변경');
   document.querySelector('#ending-status')!.textContent = doc?.originalText !== undefined ? `혼합 → ${doc.lineEnding}` : doc?.lineEnding ?? 'LF';
@@ -303,7 +330,12 @@ function showNewFile(rename = false) {
     event.preventDefault();
     let name: string;
     try { name = validateFileName(input.value); } catch (error) { element.querySelector('#name-error')!.textContent = (error as Error).message; return; }
-    if (target) { target.name = name; handles.delete(target.id); touch(target); renderExplorer(); renderTabs(); task(() => configureLanguage(target.id)); }
+    if (target) {
+      target.name = name;
+      const saveTarget = saveTargets.get(target.id);
+      if (saveTarget?.kind === 'file') { saveTargets.delete(target.id); task(() => deleteSaveTarget(target.id)); }
+      touch(target); renderExplorer(); renderTabs(); task(() => configureLanguage(target.id));
+    }
     else {
       const doc = newDocument(name); docs.set(doc.id, doc); activate(doc.id); task(() => persist(doc.id));
     }
@@ -353,7 +385,10 @@ async function importFiles(files: Array<{ file: File; handle?: LocalFileHandle }
         }
         const doc = newDocument(file.name, decoded.content, decoded); doc.exportedRevision = decoded.convertedFrom ? null : 0;
         docs.set(doc.id, doc); persistedContent.set(doc.id, doc.content);
-        if (handle) handles.set(doc.id, { handle, modified: file.lastModified });
+        if (handle) {
+          const target: SaveTarget = { projectId: doc.id, kind: 'file', fileHandle: handle, directoryName: '원본 파일 위치', fileName: file.name, lastModified: file.lastModified };
+          saveTargets.set(doc.id, target); await saveSaveTarget(target);
+        }
         activate(doc.id); await persist(doc.id); opened++;
       } catch (error) { toast(`${file.name}: ${error instanceof Error ? error.message : '파일을 열지 못했어요.'}`); }
     }
@@ -371,37 +406,108 @@ async function chooseFiles(encoding = 'auto') {
 }
 function confirmOverwrite(name: string): Promise<boolean> {
   return new Promise((resolve) => {
-    const element = dialog('원본 파일이 변경됐어요', `<p class="dialog-help">${esc(name)} 파일이 열린 뒤 다른 앱에서 바뀌었어요. 현재 편집 내용으로 덮어쓸까요?</p><div class="dialog-actions"><button class="secondary-button" data-cancel>취소</button><button class="primary-button" data-confirm>덮어쓰기</button></div>`);
+    const element = dialog('기존 파일 덮어쓰기', `<p class="dialog-help">${esc(name)} 파일이 선택한 위치에 이미 있거나, 열린 뒤 다른 앱에서 바뀌었어요. 현재 편집 내용으로 덮어쓸까요?</p><div class="dialog-actions"><button class="secondary-button" data-cancel>취소</button><button class="primary-button" data-confirm>덮어쓰기</button></div>`);
     element.querySelector('[data-cancel]')!.addEventListener('click', () => element.close());
     element.querySelector('[data-confirm]')!.addEventListener('click', () => { resolve(true); element.close(); });
     element.addEventListener('close', () => resolve(false), { once: true });
   });
 }
-async function saveFile(saveAs = false) {
+async function requestHandlePermission(handle: LocalDirectoryHandle | LocalFileHandle): Promise<void> {
+  let permission = await handle.queryPermission?.({ mode: 'readwrite' });
+  if (permission === 'granted' || permission === undefined && !handle.requestPermission) return;
+  permission = await handle.requestPermission?.({ mode: 'readwrite' });
+  if (permission && permission !== 'granted') throw new Error('저장 위치 권한이 없어요. 저장 위치 변경을 눌러 폴더를 다시 선택해 주세요.');
+}
+async function writeSnapshot(doc: TextDocument, snapshot: TextDocument, target: SaveTarget): Promise<boolean> {
+  const permissionHandle = target.kind === 'directory' ? target.directoryHandle! : target.fileHandle!;
+  await requestHandlePermission(permissionHandle);
+  let handle: LocalFileHandle;
+  let existed = false;
+  if (target.kind === 'directory') {
+    try { handle = await target.directoryHandle!.getFileHandle(doc.name); existed = true; }
+    catch (error) {
+      if (!(error instanceof DOMException) || error.name !== 'NotFoundError') throw error;
+      handle = await target.directoryHandle!.getFileHandle(doc.name, { create: true });
+    }
+  } else handle = target.fileHandle!;
+  if (existed || target.kind === 'file') {
+    let disk: File | null;
+    try { disk = await handle.getFile(); }
+    catch (error) {
+      if (error instanceof DOMException && error.name === 'NotFoundError' && target.lastModified === null) disk = null;
+      else throw error;
+    }
+    const sameFile = target.fileName === doc.name || target.kind === 'file' && target.fileName === handle.name;
+    const changedOutside = Boolean(disk && sameFile && target.lastModified !== null && disk.lastModified !== target.lastModified);
+    const newNameCollision = target.kind === 'directory' && !sameFile;
+    if ((changedOutside || newNameCollision) && !(await confirmOverwrite(doc.name))) return false;
+  }
+  const bytes = encodeText(snapshot);
+  const stream = await handle.createWritable();
+  await stream.write(new Blob([bytes.slice().buffer], { type: 'application/octet-stream' }));
+  await stream.close();
+  const file = await handle.getFile();
+  target.fileName = target.kind === 'file' ? handle.name : doc.name;
+  target.lastModified = file.lastModified;
+  target.directoryName = target.kind === 'directory' ? target.directoryHandle!.name : target.directoryName;
+  saveTargets.set(doc.id, target); await saveSaveTarget(target);
+  if (target.kind === 'file' && doc.name !== handle.name) {
+    doc.name = handle.name; doc.updatedAt = Date.now(); doc.revision++; snapshot.name = doc.name; snapshot.revision = doc.revision;
+    renderTabs(); renderExplorer(); await configureLanguage(doc.id);
+  }
+  doc.exportedRevision = snapshot.revision;
+  if (doc.revision === snapshot.revision) delete doc.convertedFrom;
+  await persist(doc.id);
+  return true;
+}
+async function saveFile(saveAs = false, forcedTarget?: SaveTarget) {
   const doc = current(); if (!doc || diskWrites.has(doc.id)) return;
   const snapshot = structuredClone(doc);
-  const existing = !saveAs ? handles.get(doc.id) : undefined;
-  // Invoke the picker directly from the gesture, before waiting for IndexedDB.
-  const picked = !existing && canPickSaveFile() ? pickSaveFile(snapshot.name) : undefined;
+  const currentTarget = forcedTarget ?? (!saveAs ? saveTargets.get(doc.id) : undefined);
+  // Open the picker before yielding so the browser accepts the user's click as permission.
+  const pickedDirectory = !currentTarget && !saveAs && canPickDirectory() ? pickDirectory() : undefined;
+  const pickedFile = !currentTarget && (saveAs || !pickedDirectory && !canPickDirectory()) && canPickSaveFile() ? pickSaveFile(snapshot.name) : undefined;
   diskWrites.add(doc.id); refreshStatus();
   try {
-    const handle = existing?.handle ?? (picked ? await picked : undefined);
-    if (existing) { const disk = await existing.handle.getFile(); if (disk.lastModified !== existing.modified && !(await confirmOverwrite(snapshot.name))) return; }
-    const bytes = encodeText(snapshot);
-    if (handle) {
-      const stream = await handle.createWritable(); await stream.write(new Blob([bytes.slice().buffer], { type: 'application/octet-stream' })); await stream.close();
-      const file = await handle.getFile(); handles.set(doc.id, { handle, modified: file.lastModified });
-      if (doc.name === snapshot.name && doc.name !== handle.name) {
-        doc.name = handle.name; const unchanged = doc.revision === snapshot.revision; doc.revision++;
-        if (unchanged) snapshot.revision = doc.revision;
-        renderTabs(); renderExplorer(); await configureLanguage(doc.id);
-      }
-    } else downloadBytes(bytes, snapshot.name);
-    doc.exportedRevision = snapshot.revision;
-    if (doc.revision === snapshot.revision) delete doc.convertedFrom;
-    try { await persist(doc.id); toast(handle ? '파일을 저장했어요.' : '현재 파일 이름으로 내려받기를 요청했어요.'); }
-    catch { toast('파일로 내보냈지만 앱 보관에 실패했어요.'); }
+    let target = currentTarget;
+    if (!target && pickedDirectory) {
+      const directoryHandle = await pickedDirectory;
+      target = { projectId: doc.id, kind: 'directory', directoryHandle, directoryName: directoryHandle.name, fileName: '', lastModified: null };
+    } else if (!target && pickedFile) {
+      const fileHandle = await pickedFile;
+      target = { projectId: doc.id, kind: 'file', fileHandle, directoryName: '선택한 파일 위치', fileName: fileHandle.name, lastModified: null };
+    }
+    if (!target) {
+      downloadBytes(encodeText(snapshot), snapshot.name);
+      doc.exportedRevision = snapshot.revision;
+      await persist(doc.id);
+      toast('브라우저에서 파일 내려받기를 시작했어요. 이 브라우저는 저장 위치를 기억하는 기능을 제공하지 않아요.');
+      return;
+    }
+    if (target !== currentTarget) { saveTargets.set(doc.id, target); await saveSaveTarget(target); }
+    const saved = await writeSnapshot(doc, snapshot, target);
+    if (saved) toast(saveAs ? '선택한 위치에 파일을 저장했어요.' : `${target.directoryName}에 파일을 저장했어요.`);
   } finally { diskWrites.delete(doc.id); refreshStatus(); }
+}
+async function changeSaveDirectory(id: string) {
+  const doc = docs.get(id); if (!doc || doc.deletedAt !== null || diskWrites.has(id)) return;
+  const pickedDirectory = canPickDirectory() ? pickDirectory() : undefined;
+  const pickedFile = !pickedDirectory && canPickSaveFile() ? pickSaveFile(doc.name) : undefined;
+  if (!pickedDirectory && !pickedFile) { toast('이 브라우저에서는 저장 위치를 기억할 수 없어요.'); return; }
+  diskWrites.add(id); refreshStatus();
+  try {
+    let target: SaveTarget;
+    if (pickedDirectory) {
+      const directoryHandle = await pickedDirectory;
+      target = { projectId: doc.id, kind: 'directory', directoryHandle, directoryName: directoryHandle.name, fileName: '', lastModified: null };
+    } else {
+      const fileHandle = await pickedFile!;
+      target = { projectId: doc.id, kind: 'file', fileHandle, directoryName: '선택한 파일 위치', fileName: fileHandle.name, lastModified: null };
+    }
+    saveTargets.set(id, target); await saveSaveTarget(target);
+    const saved = await writeSnapshot(doc, structuredClone(doc), target);
+    if (saved) toast(`저장 위치를 ${target.directoryName}(으)로 바꾸고 파일을 저장했어요.`);
+  } finally { diskWrites.delete(id); refreshStatus(); }
 }
 function showLanguage() {
   const doc = current(); if (!doc) return;
@@ -453,13 +559,76 @@ async function showRecovery() {
 }
 async function trashCurrent() {
   const doc = current(); if (!doc) return;
-  doc.deletedAt = Date.now(); await persist(doc.id); closeTab(doc.id); states.delete(doc.id); handles.delete(doc.id); renderExplorer();
-  toast('작업공간 휴지통으로 이동했어요. 원본 파일은 그대로예요.', { label: '되돌리기', run: () => task(async () => { doc.deletedAt = null; await persist(doc.id); activate(doc.id); }) });
+  await trashDocument(doc.id);
+}
+async function trashDocument(id: string) {
+  const doc = docs.get(id); if (!doc || doc.deletedAt !== null) return;
+  doc.deletedAt = Date.now(); await persist(doc.id);
+  if (openIds.includes(id)) closeTab(id);
+  states.delete(id); renderExplorer();
+  toast('작업공간 휴지통으로 이동했어요. 저장한 원본 파일은 기기에 남아 있어요.', { label: '되돌리기', run: () => task(async () => {
+    if (!docs.has(id)) return;
+    doc.deletedAt = null; await persist(doc.id); renderExplorer(); activate(doc.id);
+  }) });
+}
+async function purgeExpiredTrash(): Promise<number> {
+  const expired = expiredTrashIds([...docs.values()], trashRetentionDays);
+  if (!expired.length) return 0;
+  await deleteDocumentsPermanently(expired);
+  for (const id of expired) { docs.delete(id); saveTargets.delete(id); states.delete(id); statuses.delete(id); persistedContent.delete(id); openIds = openIds.filter((openId) => openId !== id); }
+  renderExplorer(); saveSession();
+  return expired.length;
+}
+async function permanentlyDelete(ids: string[]) {
+  await deleteDocumentsPermanently(ids);
+  for (const id of ids) { docs.delete(id); saveTargets.delete(id); states.delete(id); statuses.delete(id); persistedContent.delete(id); openIds = openIds.filter((openId) => openId !== id); }
+  renderExplorer(); saveSession();
+}
+function confirmPermanentDelete(name: string, count = 1): Promise<boolean> {
+  return new Promise((resolve) => {
+    const subject = count === 1 ? `“${name}”` : `${count}개 파일`;
+    const element = dialog('영구 삭제 확인', `<p class="dialog-help">${esc(subject)}을 My Edit 작업공간에서 영구 삭제할까요? 삭제한 파일은 복원할 수 없어요. 기기에 따로 저장한 원본 파일은 그대로 남아요.</p><div class="dialog-actions"><button class="secondary-button" data-cancel>취소</button><button class="danger-button" data-confirm>영구 삭제</button></div>`);
+    element.querySelector('[data-cancel]')!.addEventListener('click', () => element.close());
+    element.querySelector('[data-confirm]')!.addEventListener('click', () => { resolve(true); element.close(); });
+    element.addEventListener('close', () => resolve(false), { once: true });
+  });
 }
 function showTrash() {
-  const deleted = [...docs.values()].filter((doc) => doc.deletedAt !== null).sort((a, b) => b.deletedAt! - a.deletedAt!);
-  const element = dialog('작업공간 휴지통', `<div class="recovery-list">${deleted.length ? deleted.map((doc) => `<div class="trash-row"><span>${esc(doc.name)}</span><button class="secondary-button" data-restore="${esc(doc.id)}">복원</button></div>`).join('') : '<p class="dialog-help">휴지통이 비어 있어요.</p>'}</div>`);
-  element.querySelectorAll<HTMLButtonElement>('[data-restore]').forEach((button) => button.onclick = () => task(async () => { const doc = docs.get(button.dataset.restore!)!; doc.deletedAt = null; await persist(doc.id); element.close(); activate(doc.id); toast('파일을 복원했어요.'); }));
+  const element = dialog('작업공간 휴지통', `<form id="trash-retention-form"><label>휴지통 파일 자동 영구 삭제 기간 (일)<input type="number" name="days" min="1" max="365" step="1" value="${trashRetentionDays}" required></label><p class="dialog-help">지정한 기간이 지나면 My Edit를 열 때 자동으로 영구 삭제해요. 1~365일로 설정할 수 있어요.</p><div class="dialog-actions"><button type="submit" class="secondary-button">기간 적용</button><button type="button" class="danger-button" id="empty-trash">휴지통 비우기</button></div></form><div class="trash-items" id="trash-items"></div>`);
+  const list = element.querySelector<HTMLDivElement>('#trash-items')!;
+  const renderTrashItems = () => {
+    const deleted = [...docs.values()].filter((doc) => doc.deletedAt !== null).sort((a, b) => b.deletedAt! - a.deletedAt!);
+    list.innerHTML = deleted.length ? deleted.map((doc) => {
+      const expires = doc.deletedAt! + trashRetentionDays * 24 * 60 * 60 * 1000;
+      return `<div class="trash-row"><div class="trash-file-info"><b>${esc(doc.name)}</b><small>자동 삭제: ${new Date(expires).toLocaleDateString('ko-KR')}</small></div><div class="trash-file-actions"><button class="secondary-button" data-restore="${esc(doc.id)}">복원</button>${canPreview(doc) ? `<button class="secondary-button" data-trash-preview="${esc(doc.id)}">미리보기</button>` : ''}<button class="danger-button" data-permanent-delete="${esc(doc.id)}">영구 삭제</button></div></div>`;
+    }).join('') : '<p class="dialog-help">휴지통이 비어 있어요.</p>';
+    const empty = element.querySelector<HTMLButtonElement>('#empty-trash')!; empty.disabled = !deleted.length;
+    element.querySelectorAll<HTMLButtonElement>('[data-restore]').forEach((button) => button.onclick = () => task(async () => {
+      const doc = docs.get(button.dataset.restore!); if (!doc) return;
+      doc.deletedAt = null; await persist(doc.id); element.close(); renderExplorer(); activate(doc.id); toast('파일을 복원했어요.');
+    }));
+    element.querySelectorAll<HTMLButtonElement>('[data-trash-preview]').forEach((button) => button.onclick = () => showPreview(button.dataset.trashPreview));
+    element.querySelectorAll<HTMLButtonElement>('[data-permanent-delete]').forEach((button) => button.onclick = () => task(async () => {
+      const id = button.dataset.permanentDelete!; const doc = docs.get(id); if (!doc) return;
+      if (await confirmPermanentDelete(doc.name)) { await permanentlyDelete([id]); renderTrashItems(); toast('휴지통에서 영구 삭제했어요.'); }
+    }));
+  };
+  renderTrashItems();
+  element.querySelector<HTMLFormElement>('#trash-retention-form')!.addEventListener('submit', (event) => {
+    event.preventDefault(); const input = element.querySelector<HTMLInputElement>('[name="days"]')!;
+    const days = Number(input.value); if (!Number.isInteger(days) || days < 1 || days > 365) { input.setCustomValidity('1~365일 사이로 입력해 주세요.'); input.reportValidity(); return; }
+    input.setCustomValidity(''); trashRetentionDays = days;
+    try { localStorage.setItem(TRASH_RETENTION_KEY, String(days)); } catch { /* The app remains usable if browser settings are unavailable. */ }
+    task(async () => {
+      const count = await purgeExpiredTrash(); renderTrashItems();
+      toast(count ? `${days}일 보관 기간을 적용해 ${count}개 만료 파일을 영구 삭제했어요.` : `휴지통 자동 삭제 기간을 ${days}일로 설정했어요.`);
+    });
+  });
+  element.querySelector<HTMLButtonElement>('#empty-trash')!.addEventListener('click', () => task(async () => {
+    const deleted = [...docs.values()].filter((doc) => doc.deletedAt !== null);
+    if (!deleted.length || !(await confirmPermanentDelete('', deleted.length))) return;
+    await permanentlyDelete(deleted.map((doc) => doc.id)); renderTrashItems(); toast('휴지통을 비웠어요.');
+  }));
 }
 function exportBackup() {
   const text = createBackup([...docs.values()]); downloadBytes(new TextEncoder().encode(text), `my-edit-workspace-${new Date().toISOString().slice(0, 10)}.json`);
@@ -473,27 +642,57 @@ async function restoreBackup(file: File) {
   renderExplorer(); const first = added.find((doc) => doc.deletedAt === null); if (first) activate(first.id);
   toast(`${added.length}개 파일을 복원했어요. 기존 작업은 그대로 보관돼요.`);
 }
-function showPreview() {
-  const doc = current(); if (!doc) return;
-  if (detectLanguage(doc)?.name !== 'HTML') { toast('HTML 파일에서 미리보기를 열 수 있어요.'); return; }
-  const element = dialog('HTML 미리보기', '<p class="dialog-help">이 파일만 미리 봐요. 외부 리소스는 인터넷 연결이 필요할 수 있어요.</p><iframe class="preview-frame" title="HTML 미리보기" sandbox="allow-scripts allow-forms" referrerpolicy="no-referrer"></iframe>', true);
-  element.querySelector('iframe')!.srcdoc = doc.content;
+function previewType(doc: TextDocument): 'HTML' | 'SVG' | 'Markdown' | null {
+  const name = doc.name.toLowerCase();
+  if (/\.(html?|xhtml)$/.test(name) || detectLanguage(doc)?.name === 'HTML') return 'HTML';
+  if (name.endsWith('.svg')) return 'SVG';
+  if (/\.(md|markdown|mdown)$/.test(name) || detectLanguage(doc)?.name === 'Markdown') return 'Markdown';
+  return null;
+}
+function canPreview(doc: TextDocument): boolean { return previewType(doc) !== null; }
+function showPreview(id = activeId ?? undefined) {
+  const doc = id ? docs.get(id) : undefined; if (!doc) return;
+  const type = previewType(doc); if (!type) { toast('HTML, SVG, Markdown 파일에서 미리보기를 열 수 있어요.'); return; }
+  const element = dialog(`${doc.name} 미리보기`, `<p class="dialog-help">${type === 'HTML' ? 'HTML을 격리된 프레임에서 실행해요. 외부 리소스는 인터넷 연결이 필요할 수 있어요.' : type === 'SVG' ? 'SVG 파일을 격리된 프레임에서 표시해요.' : 'Markdown을 안전한 HTML로 변환해 표시해요.'}</p><iframe class="preview-frame" title="${esc(doc.name)} 미리보기" sandbox="${type === 'HTML' ? 'allow-scripts allow-forms' : ''}" referrerpolicy="no-referrer"></iframe>`, true);
+  const frame = element.querySelector<HTMLIFrameElement>('iframe')!;
+  frame.srcdoc = type === 'Markdown' ? markdownToHtml(doc.content) : doc.content;
+}
+function showFileOptions(id: string, x?: number, y?: number) {
+  const doc = docs.get(id); if (!doc || doc.deletedAt !== null) return;
+  const host = document.querySelector<HTMLDivElement>('#file-menu')!;
+  const items: Array<[string, string, string]> = [
+    ['open-file', 'code', '파일 열기'],
+    ...(canPreview(doc) ? [['preview-file', 'eye', '미리보기'] as [string, string, string]] : []),
+    ['save-file', 'save', '저장'], ['change-location', 'folder', '저장 위치 변경'],
+    ['rename-file', 'code', '이름 바꾸기'], ['trash-file', 'trash', '휴지통으로 이동']
+  ];
+  host.setAttribute('aria-label', `${doc.name} 파일 옵션`);
+  host.innerHTML = `<div class="file-menu-heading">${esc(doc.name)}</div>${items.map(([action, glyph, label]) => `<button role="menuitem" data-action="${action}" data-document-id="${esc(id)}">${icon(glyph)}<span>${label}</span></button>`).join('')}`;
+  host.hidden = false;
+  const more = document.querySelector<HTMLElement>('[data-action="more"]'); more?.setAttribute('aria-expanded', 'true');
+  if (x !== undefined && y !== undefined) {
+    const left = Math.max(8, Math.min(x, window.innerWidth - 326));
+    const top = Math.max(64, Math.min(y, window.innerHeight - 300));
+    host.style.left = `${left}px`; host.style.right = 'auto'; host.style.top = `${top}px`;
+  } else { host.style.left = ''; host.style.right = '15px'; host.style.top = '153px'; }
+  host.querySelector<HTMLButtonElement>('button')?.focus();
 }
 function toggleMenu() {
   const host = document.querySelector<HTMLDivElement>('#file-menu')!;
   if (!host.hidden) { closeMenu(); return; }
+  host.removeAttribute('aria-label'); host.style.left = ''; host.style.right = '15px'; host.style.top = '153px';
   const doc = current();
   const items: Array<[string, string, string, string?]> = [
     ['new', 'plus', '새 파일', ''], ['open', 'folder', '파일 열기', 'Ctrl+O'], ['open-encoding', 'folder', '인코딩을 지정해서 열기'],
     ...(doc ? [['undo', 'undo', '실행 취소', 'Ctrl+Z'], ['redo', 'redo', '다시 실행', 'Ctrl+Shift+Z']] as Array<[string, string, string, string?]> : []),
-    ...(doc ? [['save-as', 'save', '다른 이름으로 저장', 'Ctrl+Shift+S'], ['rename', 'code', '파일 이름 바꾸기'], ['language', 'code', '언어 모드 선택'], ['format', 'settings', '인코딩 · 줄바꿈'], ['goto', 'arrow', '줄로 이동', 'Ctrl+G'], ['comment', 'code', '주석 토글', 'Ctrl+/'], ['recovery', 'history', '이전 내용 복구'], ...(detectLanguage(doc)?.name === 'HTML' ? [['preview', 'eye', 'HTML 미리보기']] : []), ['delete', 'trash', '작업공간에서 휴지통으로']] as Array<[string, string, string, string?]> : []),
+    ...(doc ? [['save-as', 'save', '다른 이름으로 저장', 'Ctrl+Shift+S'], ['save-location', 'folder', '저장 위치 변경'], ['rename', 'code', '파일 이름 바꾸기'], ['language', 'code', '언어 모드 선택'], ['format', 'settings', '인코딩 · 줄바꿈'], ['goto', 'arrow', '줄로 이동', 'Ctrl+G'], ['comment', 'code', '주석 토글', 'Ctrl+/'], ['recovery', 'history', '이전 내용 복구'], ...(canPreview(doc) ? [['preview', 'eye', '미리보기']] : []), ['delete', 'trash', '작업공간에서 휴지통으로']] as Array<[string, string, string, string?]> : []),
     ['settings', 'settings', '편집기 설정'], ['backup-export', 'download', '작업공간 백업'], ['backup-import', 'history', '백업 가져오기'], ['trash', 'trash', '휴지통'], ['update', 'download', '앱 업데이트 확인']
   ];
   host.innerHTML = items.map(([action, glyph, label, shortcut]) => `<button data-action="${action}">${icon(glyph)}<span>${label}</span>${shortcut ? `<kbd>${shortcut}</kbd>` : ''}</button>`).join('');
   host.hidden = false; document.querySelector('[data-action="more"]')!.setAttribute('aria-expanded', 'true');
   host.querySelector('button')?.focus();
 }
-function closeMenu() { (document.querySelector('#file-menu') as HTMLElement).hidden = true; document.querySelector('[data-action="more"]')!.setAttribute('aria-expanded', 'false'); }
+function closeMenu() { const host = document.querySelector<HTMLElement>('#file-menu'); if (host) host.hidden = true; document.querySelector('[data-action="more"]')?.setAttribute('aria-expanded', 'false'); }
 function updateOfflineStatus() {
   const element = document.querySelector('#offline-status'); if (!element) return;
   const ready = offlineReady || Boolean(navigator.serviceWorker?.controller);
@@ -519,17 +718,31 @@ function showUpdate() {
 document.addEventListener('click', (event) => {
   const target = event.target as Element;
   if (!target.closest('#file-menu, [data-action="more"]') && document.querySelector('#file-menu')) closeMenu();
-  const open = target.closest<HTMLElement>('[data-open]'); if (open) { activate(open.dataset.open!); return; }
+  const fileOptions = target.closest<HTMLElement>('[data-file-options]');
+  if (fileOptions) { event.preventDefault(); showFileOptions(fileOptions.dataset.fileOptions!); return; }
+  const open = target.closest<HTMLElement>('[data-open]'); if (open) {
+    if (suppressFileClickId === open.dataset.open) { suppressFileClickId = null; event.preventDefault(); return; }
+    activate(open.dataset.open!); return;
+  }
   const close = target.closest<HTMLElement>('[data-close]'); if (close) { closeTab(close.dataset.close!); return; }
-  const action = target.closest<HTMLElement>('[data-action]')?.dataset.action; if (!action) return;
+  const actionElement = target.closest<HTMLElement>('[data-action]');
+  const action = actionElement?.dataset.action; if (!action) return;
+  const fileId = actionElement.dataset.documentId;
   if (action !== 'more') closeMenu();
-  if (action === 'welcome') { event.preventDefault(); activate(null); }
+  if (action === 'open-file' && fileId) activate(fileId);
+  else if (action === 'preview-file' && fileId) showPreview(fileId);
+  else if (action === 'save-file' && fileId) { activate(fileId); task(() => saveFile()); }
+  else if (action === 'change-location' && fileId) task(() => changeSaveDirectory(fileId));
+  else if (action === 'rename-file' && fileId) { activate(fileId); showNewFile(true); }
+  else if (action === 'trash-file' && fileId) task(() => trashDocument(fileId));
+  else if (action === 'welcome') { event.preventDefault(); activate(null); }
   else if (action === 'sidebar') document.querySelector('.workbench')!.classList.toggle('sidebar-open');
   else if (action === 'new') showNewFile();
   else if (action === 'open') task(() => chooseFiles());
   else if (action === 'open-encoding') showReadOptions();
   else if (action === 'save') task(() => saveFile());
   else if (action === 'save-as') task(() => saveFile(true));
+  else if (action === 'save-location' && current()) task(() => changeSaveDirectory(current()!.id));
   else if (action === 'rename') showNewFile(true);
   else if (action === 'more') toggleMenu();
   else if (action === 'find' && view && current()) openSearchPanel(view);
@@ -578,6 +791,8 @@ window.addEventListener('pagehide', () => { void flushAll().catch(() => {}); });
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') void flushAll().catch(() => {}); });
 
 async function start() {
+  const storedRetention = Number(readPreference(TRASH_RETENTION_KEY));
+  if (Number.isInteger(storedRetention) && storedRetention >= 1 && storedRetention <= 365) trashRetentionDays = storedRetention;
   const storedSettings = readPreference('my-edit-settings-v2') as Partial<Settings> | null;
   if (storedSettings) settings = { wrap: storedSettings.wrap === true, indent: ['  ', '    ', '\t'].includes(storedSettings.indent ?? '') ? storedSettings.indent! : '  ', fontSize: [12, 13, 14, 15, 16, 18, 20, 24].includes(storedSettings.fontSize ?? 0) ? storedSettings.fontSize! : 14 };
   renderShell();
@@ -587,10 +802,13 @@ async function start() {
   });
   try {
     for (const doc of await listDocuments()) { docs.set(doc.id, doc); persistedContent.set(doc.id, doc.content); statuses.set(doc.id, 'saved'); }
+    for (const target of await listSaveTargets()) if (docs.has(target.projectId)) saveTargets.set(target.projectId, target);
+    await purgeExpiredTrash();
     const session = readPreference('my-edit-session-v2') as { openIds?: unknown; activeId?: unknown } | null;
     if (Array.isArray(session?.openIds)) openIds = [...new Set(session.openIds.filter((id): id is string => typeof id === 'string' && docs.has(id) && docs.get(id)!.deletedAt === null))];
     activate(typeof session?.activeId === 'string' && openIds.includes(session.activeId) ? session.activeId : openIds[0] ?? null);
     updateOfflineStatus();
+    window.setInterval(() => task(async () => { await purgeExpiredTrash(); }), 60 * 60 * 1000);
     if (navigator.storage?.persist) void navigator.storage.persist().catch(() => {});
   } catch (error) {
     dialog('작업공간을 열 수 없어요', `<p class="dialog-help">${esc(error instanceof Error ? error.message : '브라우저 저장 공간을 확인해 주세요.')}<br><br>기존 파일을 보호하기 위해 새 작업을 시작하지 않았어요. 다른 My Edit 탭을 닫고 다시 열어 주세요.</p><div class="dialog-actions"><button class="primary-button" data-retry>다시 시도</button></div>`).querySelector('[data-retry]')!.addEventListener('click', () => location.reload());

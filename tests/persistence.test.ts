@@ -2,7 +2,7 @@ import 'fake-indexeddb/auto';
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { newDocument } from '../app/src/documents.ts';
-import { listDocuments, saveDocument, addRestoredDocuments, listRecoveryPoints } from '../app/src/persistence.ts';
+import { deleteDocumentsPermanently, listDocuments, listSaveTargets, saveDocument, saveSaveTarget, addRestoredDocuments, listRecoveryPoints } from '../app/src/persistence.ts';
 
 // Seed the exact v1 store layout before the new persistence module opens it.
 await new Promise<void>((resolve, reject) => {
@@ -37,4 +37,14 @@ test('restoring duplicate IDs adds copies and does not overwrite current work', 
   assert.notEqual(restored[0].id, original.id); assert.notEqual(restored[0].id, restored[1].id);
   const all = await listDocuments(); assert.equal(all.find((doc) => doc.id === original.id)!.content, 'VALUE=original');
   assert.equal(all.find((doc) => doc.id === restored[0].id)!.content, 'VALUE=backup');
+});
+test('permanent deletion removes workspace data, save location, and recovery points together', async () => {
+  const doc = newDocument('discard.txt', 'content');
+  await saveDocument(doc, 'previous');
+  await saveSaveTarget({ projectId: doc.id, kind: 'directory', directoryHandle: { name: 'Test folder' } as never, directoryName: 'Test folder', fileName: 'discard.txt', lastModified: 10 });
+  assert.equal((await listSaveTargets()).some((target) => target.projectId === doc.id), true);
+  await deleteDocumentsPermanently([doc.id]);
+  assert.equal((await listDocuments()).some((item) => item.id === doc.id), false);
+  assert.equal((await listSaveTargets()).some((target) => target.projectId === doc.id), false);
+  assert.deepEqual(await listRecoveryPoints(doc.id), []);
 });
