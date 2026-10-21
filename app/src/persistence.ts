@@ -1,26 +1,9 @@
-export interface Project {
-  id: string;
-  name: string;
-  content: string;
-  createdAt: number;
-  updatedAt: number;
-  deletedAt: number | null;
-  cursor: number;
-}
-
-export interface RecoveryPoint {
-  id: string;
-  projectId: string;
-  content: string;
-  createdAt: number;
-}
-
+import { normalizeDocument } from './documents.ts';
+import type { TextDocument } from './documents.ts';
+export interface RecoveryPoint { id: string; projectId: string; content: string; createdAt: number }
 const DB_NAME = 'my-edit-local';
-const DB_VERSION = 1;
-const MAX_RECOVERY_POINTS = 20;
-
+const DB_VERSION = 2;
 let dbPromise: Promise<IDBDatabase> | undefined;
-
 function openDatabase(): Promise<IDBDatabase> {
   if (dbPromise) return dbPromise;
   dbPromise = new Promise((resolve, reject) => {
@@ -28,141 +11,76 @@ function openDatabase(): Promise<IDBDatabase> {
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains('projects')) {
-        const projects = db.createObjectStore('projects', { keyPath: 'id' });
-        projects.createIndex('updatedAt', 'updatedAt');
+        const store = db.createObjectStore('projects', { keyPath: 'id' }); store.createIndex('updatedAt', 'updatedAt');
+      } else {
+        const cursor = request.transaction!.objectStore('projects').openCursor();
+        cursor.onsuccess = () => {
+          const row = cursor.result; if (!row) return;
+          row.update(normalizeDocument(row.value)); row.continue();
+        };
       }
       if (!db.objectStoreNames.contains('recovery')) {
-        const recovery = db.createObjectStore('recovery', { keyPath: 'id' });
-        recovery.createIndex('projectId', 'projectId');
+        const store = db.createObjectStore('recovery', { keyPath: 'id' }); store.createIndex('projectId', 'projectId');
       }
     };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error ?? new Error('저장소를 열 수 없습니다.'));
-    request.onblocked = () => reject(new Error('다른 탭에서 저장소를 업데이트하고 있습니다.'));
+    request.onsuccess = () => {
+      request.result.onversionchange = () => { request.result.close(); dbPromise = undefined; };
+      resolve(request.result);
+    };
+    request.onerror = () => { dbPromise = undefined; reject(request.error ?? new Error('저장소를 열 수 없어요.')); };
+    request.onblocked = () => { dbPromise = undefined; reject(new Error('다른 My Edit 탭을 닫고 다시 시도해 주세요.')); };
   });
   return dbPromise;
 }
-
-function requestResult<T>(request: IDBRequest<T>): Promise<T> {
+function transactionDone(tx: IDBTransaction): Promise<void> {
   return new Promise((resolve, reject) => {
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error ?? new Error('저장에 실패했습니다.'));
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error ?? new Error('앱에 저장하지 못했어요. 파일을 내려받아 보관해 주세요.'));
+    tx.onabort = () => reject(tx.error ?? new Error('저장이 취소됐어요.'));
   });
 }
-
-export async function listProjects(includeDeleted = false): Promise<Project[]> {
+export async function listDocuments(): Promise<TextDocument[]> {
   const db = await openDatabase();
-  const tx = db.transaction('projects', 'readonly');
-  const rows = await requestResult(tx.objectStore('projects').getAll()) as Project[];
-  return rows
-    .filter((project) => includeDeleted || project.deletedAt === null)
-    .sort((a, b) => b.updatedAt - a.updatedAt);
+  const request = db.transaction('projects', 'readonly').objectStore('projects').getAll();
+  const rows = await new Promise<unknown[]>((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error);
+  });
+  return rows.map(normalizeDocument).sort((a, b) => b.updatedAt - a.updatedAt);
 }
-
-export async function getProject(id: string): Promise<Project | undefined> {
+export async function saveDocument(document: TextDocument, previousContent?: string): Promise<void> {
+  const snapshot = structuredClone(document);
   const db = await openDatabase();
-  return requestResult(db.transaction('projects', 'readonly').objectStore('projects').get(id));
-}
-
-export async function createProject(name = '새 HTML', content = starterHtml()): Promise<Project> {
-  const now = Date.now();
-  const project: Project = {
-    id: crypto.randomUUID(), name, content, createdAt: now, updatedAt: now, deletedAt: null, cursor: 0
-  };
-  const db = await openDatabase();
-  await requestResult(db.transaction('projects', 'readwrite').objectStore('projects').add(project));
-  return project;
-}
-
-export async function saveProject(project: Project, recoveryContent?: string): Promise<void> {
-  const db = await openDatabase();
-  const tx = db.transaction(recoveryContent !== undefined ? ['projects', 'recovery'] : ['projects'], 'readwrite');
-  tx.objectStore('projects').put({ ...project, updatedAt: Date.now() });
-  if (recoveryContent !== undefined) {
+  const tx = db.transaction(previousContent === undefined ? ['projects'] : ['projects', 'recovery'], 'readwrite');
+  const done = transactionDone(tx);
+  tx.objectStore('projects').put(snapshot);
+  if (previousContent !== undefined) {
     const store = tx.objectStore('recovery');
-    const point: RecoveryPoint = {
-      id: crypto.randomUUID(), projectId: project.id, content: recoveryContent, createdAt: Date.now()
-    };
-    store.add(point);
-    const request = store.index('projectId').getAll(project.id);
+    store.add({ id: crypto.randomUUID(), projectId: snapshot.id, content: previousContent, createdAt: Date.now() } satisfies RecoveryPoint);
+    const request = store.index('projectId').getAll(snapshot.id);
     request.onsuccess = () => {
       const points = (request.result as RecoveryPoint[]).sort((a, b) => b.createdAt - a.createdAt);
-      points.slice(MAX_RECOVERY_POINTS).forEach((oldPoint) => store.delete(oldPoint.id));
+      for (const point of points.slice(20)) store.delete(point.id);
     };
   }
-  await new Promise<void>((resolve, reject) => {
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error ?? new Error('저장에 실패했습니다.'));
-    tx.onabort = () => reject(tx.error ?? new Error('저장이 취소되었습니다.'));
-  });
+  await done;
 }
-
-export async function listRecoveryPoints(projectId: string): Promise<RecoveryPoint[]> {
+export async function listRecoveryPoints(id: string): Promise<RecoveryPoint[]> {
   const db = await openDatabase();
-  const rows = await requestResult(db.transaction('recovery', 'readonly').objectStore('recovery').index('projectId').getAll(projectId)) as RecoveryPoint[];
-  return rows.sort((a, b) => b.createdAt - a.createdAt);
+  const request = db.transaction('recovery', 'readonly').objectStore('recovery').index('projectId').getAll(id);
+  const points = await new Promise<RecoveryPoint[]>((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result); request.onerror = () => reject(request.error);
+  });
+  return points.sort((a, b) => b.createdAt - a.createdAt);
 }
-
-export async function renameProject(id: string, name: string): Promise<void> {
-  const project = await getProject(id);
-  if (!project) throw new Error('문서를 찾을 수 없습니다.');
-  project.name = name.trim() || '제목 없음';
-  await saveProject(project);
-}
-
-export async function softDeleteProject(id: string): Promise<void> {
-  const project = await getProject(id);
-  if (!project) return;
-  project.deletedAt = Date.now();
-  await saveProject(project);
-}
-
-export async function restoreProject(id: string): Promise<void> {
-  const project = await getProject(id);
-  if (!project) return;
-  project.deletedAt = null;
-  await saveProject(project);
-}
-
-export async function replaceAllProjects(projects: Project[]): Promise<void> {
+export async function addRestoredDocuments(incoming: TextDocument[], existingIds: Set<string>): Promise<TextDocument[]> {
+  const documents = incoming.map((document) => {
+    const copy = structuredClone(document);
+    if (existingIds.has(copy.id)) copy.id = crypto.randomUUID();
+    existingIds.add(copy.id); return copy;
+  });
   const db = await openDatabase();
   const tx = db.transaction('projects', 'readwrite');
-  const store = tx.objectStore('projects');
-  for (const project of projects) store.put(project);
-  await new Promise<void>((resolve, reject) => {
-    tx.oncomplete = () => resolve();
-    tx.onerror = () => reject(tx.error ?? new Error('백업을 가져오지 못했습니다.'));
-    tx.onabort = () => reject(tx.error ?? new Error('백업 가져오기가 취소되었습니다.'));
-  });
-}
-
-export function starterHtml(): string {
-  return `<!doctype html>
-<html lang="ko">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>나의 첫 페이지</title>
-  <style>
-    :root { color-scheme: light; font-family: system-ui, sans-serif; }
-    body { min-height: 100vh; display: grid; place-content: center; margin: 0; background: #f5f6ef; color: #20231a; }
-    main { max-width: 36rem; padding: 2rem; }
-    h1 { font-size: clamp(2rem, 8vw, 4rem); letter-spacing: -.06em; }
-    button { border: 0; border-radius: 999px; padding: .8rem 1.1rem; background: #d7f36b; font: inherit; cursor: pointer; }
-  </style>
-</head>
-<body>
-  <main>
-    <p>My Edit에서 만든 첫 페이지</p>
-    <h1>여기서 시작해요.</h1>
-    <button id="hello">눌러 보기</button>
-    <p id="message"></p>
-  </main>
-  <script>
-    document.querySelector('#hello').addEventListener('click', () => {
-      document.querySelector('#message').textContent = 'HTML, CSS, JavaScript가 잘 실행돼요!';
-    });
-  </script>
-</body>
-</html>`;
+  const done = transactionDone(tx);
+  for (const document of documents) tx.objectStore('projects').add(document);
+  await done; return documents;
 }

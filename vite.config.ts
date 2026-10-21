@@ -11,39 +11,30 @@ export default defineConfig({
       registerType: 'prompt',
       includeAssets: ['favicon.svg'],
       manifest: {
-        name: 'My Edit — HTML Editor',
+        id: basePath,
+        name: 'My Edit — Code & Text Editor',
         short_name: 'My Edit',
-        description: 'Write and preview HTML offline.',
+        description: 'Open, create and edit code, text and configuration files offline.',
         lang: 'ko',
         start_url: basePath,
         scope: basePath,
         display: 'standalone',
         orientation: 'any',
-        theme_color: '#111318',
-        background_color: '#111318',
+        theme_color: '#1e2620',
+        background_color: '#171b1c',
         icons: [
-          { src: `${basePath}icons/icon-192.svg`, sizes: '192x192', type: 'image/svg+xml', purpose: 'any' },
-          { src: `${basePath}icons/icon-512.svg`, sizes: '512x512', type: 'image/svg+xml', purpose: 'any' },
-          { src: `${basePath}icons/icon-512.svg`, sizes: '512x512', type: 'image/svg+xml', purpose: 'maskable' }
+          { src: `${basePath}icons/icon-192.png`, sizes: '192x192', type: 'image/png', purpose: 'any' },
+          { src: `${basePath}icons/icon-512.png`, sizes: '512x512', type: 'image/png', purpose: 'any' },
+          { src: `${basePath}icons/icon-maskable-512.png`, sizes: '512x512', type: 'image/png', purpose: 'maskable' }
         ]
       },
       workbox: {
         mode: 'development',
-        globPatterns: ['**/*.{js,css,html,svg,woff2,webmanifest}'],
+        globPatterns: ['**/*.{js,css,html,svg,png,woff2,webmanifest}'],
         navigateFallback: `${basePath}index.html`,
         cleanupOutdatedCaches: true
       }
     })
   ],
-  build: {
-    outDir: '../dist',
-    emptyOutDir: true,
-    rollupOptions: {
-      output: {
-        manualChunks(id) {
-          if (id.includes('node_modules/@codemirror/') || id.includes('node_modules/@lezer/')) return 'codemirror';
-        }
-      }
-    }
-  }
+  build: { outDir: '../dist', emptyOutDir: true }
 });
