@@ -2,13 +2,13 @@ export interface LocalFileHandle {
   name: string;
   getFile(): Promise<File>;
   createWritable(): Promise<{ write(value: Blob): Promise<void>; close(): Promise<void> }>;
-  queryPermission?(options: { mode: 'readwrite' }): Promise<PermissionState>;
+  queryPermission?(options: { mode: 'read' | 'readwrite' }): Promise<PermissionState>;
   requestPermission?(options: { mode: 'readwrite' }): Promise<PermissionState>;
 }
 export interface LocalDirectoryHandle {
   name: string;
   getFileHandle(name: string, options?: { create?: boolean }): Promise<LocalFileHandle>;
-  queryPermission?(options: { mode: 'readwrite' }): Promise<PermissionState>;
+  queryPermission?(options: { mode: 'read' | 'readwrite' }): Promise<PermissionState>;
   requestPermission?(options: { mode: 'readwrite' }): Promise<PermissionState>;
 }
 interface FilePickerWindow extends Window {

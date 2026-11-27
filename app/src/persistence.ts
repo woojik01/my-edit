@@ -10,6 +10,7 @@ export interface SaveTarget {
   directoryName: string;
   fileName: string;
   lastModified: number | null;
+  lastSize?: number;
 }
 const DB_NAME = 'my-edit-local';
 const DB_VERSION = 3;
