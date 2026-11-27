@@ -33,6 +33,7 @@ const recoveryTimes = new Map<string, number>();
 const saveTargets = new Map<string, SaveTarget>();
 const languageLoads = new Map<string, number>();
 const diskWrites = new Set<string>();
+const externalChangeVersions = new Map<string, string>();
 const modeCompartment = new Compartment();
 const wrapCompartment = new Compartment();
 const indentCompartment = new Compartment();
@@ -52,6 +53,8 @@ let explorerQuery = '';
 let trashRetentionDays = 30;
 let longPressTimer = 0;
 let suppressFileClickId: string | null = null;
+let externalCheckRunning = false;
+const EXTERNAL_FILE_CHECK_INTERVAL_MS = 5_000;
 const TRASH_RETENTION_KEY = 'my-edit-trash-retention-days';
 
 const esc = (value: string): string => value.replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]!);
@@ -470,7 +473,7 @@ async function importFiles(files: Array<{ file: File; handle?: LocalFileHandle }
         const doc = newDocument(file.name, decoded.content, decoded); doc.exportedRevision = decoded.convertedFrom ? null : 0;
         docs.set(doc.id, doc); persistedContent.set(doc.id, doc.content);
         if (handle) {
-          const target: SaveTarget = { projectId: doc.id, kind: 'file', fileHandle: handle, directoryName: '원본 파일 위치', fileName: file.name, lastModified: file.lastModified };
+          const target: SaveTarget = { projectId: doc.id, kind: 'file', fileHandle: handle, directoryName: '원본 파일 위치', fileName: file.name, lastModified: file.lastModified, lastSize: file.size };
           saveTargets.set(doc.id, target); await saveSaveTarget(target);
         }
         activate(doc.id); await persist(doc.id); opened++;
@@ -494,6 +497,14 @@ function confirmOverwrite(name: string): Promise<boolean> {
     element.querySelector('[data-cancel]')!.addEventListener('click', () => element.close());
     element.querySelector('[data-confirm]')!.addEventListener('click', () => { resolve(true); element.close(); });
     element.addEventListener('close', () => resolve(false), { once: true });
+  });
+}
+function confirmExternalChange(name: string): Promise<'reload' | 'keep'> {
+  return new Promise((resolve) => {
+    const element = dialog('기기 파일이 바뀌었어요', `<p class="dialog-help"><b>${esc(name)}</b> 파일이 My Edit에서 열린 뒤 기기에서 수정됐어요. 기기 내용을 불러오거나 현재 편집 내용을 유지할 수 있어요.</p><div class="dialog-actions"><button class="secondary-button" data-keep>현재 편집 유지</button><button class="primary-button" data-reload>변경 내용 불러오기</button></div>`);
+    element.querySelector('[data-keep]')!.addEventListener('click', () => { resolve('keep'); element.close(); });
+    element.querySelector('[data-reload]')!.addEventListener('click', () => { resolve('reload'); element.close(); });
+    element.addEventListener('close', () => resolve('keep'), { once: true });
   });
 }
 async function requestHandlePermission(handle: LocalDirectoryHandle | LocalFileHandle): Promise<void> {
@@ -522,7 +533,7 @@ async function writeSnapshot(doc: TextDocument, snapshot: TextDocument, target: 
       else throw error;
     }
     const sameFile = target.fileName === doc.name || target.kind === 'file' && target.fileName === handle.name;
-    const changedOutside = Boolean(disk && sameFile && target.lastModified !== null && disk.lastModified !== target.lastModified);
+    const changedOutside = Boolean(disk && sameFile && target.lastModified !== null && (disk.lastModified !== target.lastModified || target.lastSize !== undefined && disk.size !== target.lastSize));
     const newNameCollision = target.kind === 'directory' && !sameFile;
     if ((changedOutside || newNameCollision) && !(await confirmOverwrite(doc.name))) return false;
   }
@@ -533,8 +544,9 @@ async function writeSnapshot(doc: TextDocument, snapshot: TextDocument, target: 
   const file = await handle.getFile();
   target.fileName = target.kind === 'file' ? handle.name : doc.name;
   target.lastModified = file.lastModified;
+  target.lastSize = file.size;
   target.directoryName = target.kind === 'directory' ? target.directoryHandle!.name : target.directoryName;
-  saveTargets.set(doc.id, target); await saveSaveTarget(target);
+  saveTargets.set(doc.id, target); externalChangeVersions.delete(doc.id); await saveSaveTarget(target);
   if (target.kind === 'file' && doc.name !== handle.name) {
     doc.name = handle.name; doc.updatedAt = Date.now(); doc.revision++; snapshot.name = doc.name; snapshot.revision = doc.revision;
     renderTabs(); renderExplorer(); await configureLanguage(doc.id);
@@ -543,6 +555,77 @@ async function writeSnapshot(doc: TextDocument, snapshot: TextDocument, target: 
   if (doc.revision === snapshot.revision) delete doc.convertedFrom;
   await persist(doc.id);
   return true;
+}
+function externalFileVersion(file: File): string { return `${file.lastModified}:${file.size}`; }
+async function reloadExternalFile(doc: TextDocument, target: SaveTarget, handle: LocalFileHandle): Promise<void> {
+  const file = await handle.getFile();
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let decoded: DecodedText | null;
+  try { decoded = decodeText(bytes); }
+  catch (error) {
+    if (!(error instanceof FileReadError) || error.kind !== 'encoding') throw error;
+    decoded = await chooseEncoding(bytes, file.name, error.message);
+  }
+  if (!decoded) return;
+
+  await persist(doc.id, true);
+  doc.content = decoded.content;
+  doc.encoding = decoded.encoding;
+  doc.bom = decoded.bom;
+  doc.lineEnding = decoded.lineEnding;
+  if (decoded.originalText !== undefined) doc.originalText = decoded.originalText; else delete doc.originalText;
+  if (decoded.convertedFrom) doc.convertedFrom = decoded.convertedFrom; else delete doc.convertedFrom;
+  doc.cursor = Math.min(doc.cursor, doc.content.length);
+  doc.updatedAt = Date.now();
+  doc.revision++;
+  doc.exportedRevision = decoded.convertedFrom ? null : doc.revision;
+
+  target.fileName = target.kind === 'file' ? handle.name : doc.name;
+  target.lastModified = file.lastModified;
+  target.lastSize = file.size;
+  saveTargets.set(doc.id, target);
+  externalChangeVersions.set(doc.id, externalFileVersion(file));
+  await saveSaveTarget(target);
+
+  states.delete(doc.id);
+  if (activeId === doc.id && view) view.setState(createEditorState(doc));
+  await persist(doc.id);
+  await configureLanguage(doc.id);
+  renderTabs(); renderExplorer(); refreshStatus();
+  toast(`${doc.name} 파일의 변경 내용을 불러왔어요.`);
+}
+async function checkExternalFileChanges(): Promise<void> {
+  if (externalCheckRunning || document.visibilityState !== 'visible' || document.querySelector('dialog[open]')) return;
+  externalCheckRunning = true;
+  try {
+    for (const id of [...openIds]) {
+      const doc = docs.get(id), target = saveTargets.get(id);
+      if (!doc || !target || target.lastModified === null || diskWrites.has(id)) continue;
+      if (target.kind === 'directory' && target.fileName !== doc.name) continue;
+      try {
+        const permissionHandle = target.kind === 'directory' ? target.directoryHandle! : target.fileHandle!;
+        const permission = await permissionHandle.queryPermission?.({ mode: 'read' });
+        if (permission && permission !== 'granted') continue;
+        const handle = target.kind === 'directory' ? await target.directoryHandle!.getFileHandle(doc.name) : target.fileHandle!;
+        const file = await handle.getFile();
+        if (diskWrites.has(id)) continue;
+        const changedOutside = file.lastModified !== target.lastModified || target.lastSize !== undefined && file.size !== target.lastSize;
+        if (!changedOutside) {
+          externalChangeVersions.delete(id);
+          if (target.lastSize === undefined) { target.lastSize = file.size; await saveSaveTarget(target); }
+          continue;
+        }
+        const version = externalFileVersion(file);
+        if (externalChangeVersions.get(id) === version) continue;
+        externalChangeVersions.set(id, version);
+        const choice = await confirmExternalChange(doc.name);
+        if (choice === 'reload') await reloadExternalFile(doc, target, handle);
+      } catch (error) {
+        if (error instanceof DOMException && ['NotAllowedError', 'NotFoundError', 'SecurityError'].includes(error.name)) continue;
+        reportError(error);
+      }
+    }
+  } finally { externalCheckRunning = false; }
 }
 async function saveFile(saveAs = false, forcedTarget?: SaveTarget) {
   const doc = current(); if (!doc || diskWrites.has(doc.id)) return;
@@ -872,7 +955,11 @@ document.addEventListener('drop', (event) => { if (!event.dataTransfer?.files.le
 window.addEventListener('online', updateOfflineStatus); window.addEventListener('offline', updateOfflineStatus);
 window.addEventListener('beforeinstallprompt', (event) => { event.preventDefault(); installPrompt = event as BeforeInstallPromptEvent; });
 window.addEventListener('pagehide', () => { void flushAll().catch(() => {}); });
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') void flushAll().catch(() => {}); });
+window.addEventListener('focus', () => task(checkExternalFileChanges));
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') void flushAll().catch(() => {});
+  else task(checkExternalFileChanges);
+});
 
 async function start() {
   const storedRetention = Number(readPreference(TRASH_RETENTION_KEY));
@@ -892,6 +979,8 @@ async function start() {
     if (Array.isArray(session?.openIds)) openIds = [...new Set(session.openIds.filter((id): id is string => typeof id === 'string' && docs.has(id) && docs.get(id)!.deletedAt === null))];
     activate(typeof session?.activeId === 'string' && openIds.includes(session.activeId) ? session.activeId : openIds[0] ?? null);
     updateOfflineStatus();
+    task(checkExternalFileChanges);
+    window.setInterval(() => task(checkExternalFileChanges), EXTERNAL_FILE_CHECK_INTERVAL_MS);
     window.setInterval(() => task(async () => { await purgeExpiredTrash(); }), 60 * 60 * 1000);
     if (navigator.storage?.persist) void navigator.storage.persist().catch(() => {});
   } catch (error) {
