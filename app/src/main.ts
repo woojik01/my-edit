@@ -619,7 +619,19 @@ async function checkExternalFileChanges(): Promise<void> {
         if (externalChangeVersions.get(id) === version) continue;
         externalChangeVersions.set(id, version);
         const choice = await confirmExternalChange(doc.name);
-        if (choice === 'reload') await reloadExternalFile(doc, target, handle);
+        if (choice === 'reload') {
+          const wasInert = root.inert;
+          root.inert = true;
+          diskWrites.add(id);
+          refreshStatus();
+          try { await reloadExternalFile(doc, target, handle); }
+          finally {
+            root.inert = wasInert;
+            diskWrites.delete(id);
+            refreshStatus();
+            if (activeId === id) view?.focus();
+          }
+        }
       } catch (error) {
         if (error instanceof DOMException && ['NotAllowedError', 'NotFoundError', 'SecurityError'].includes(error.name)) continue;
         reportError(error);
